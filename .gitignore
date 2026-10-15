@@ -1,3 +1,26 @@
 .env
 .env.local
 node_modules/
+
+# BugScope AI Python backend
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Frontend generated files
+node_modules/
+dist/
+
+# Test output
+.coverage
+htmlcov/
+
+# Vite cache
+.vite/
