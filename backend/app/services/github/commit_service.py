@@ -1,11 +1,8 @@
-import requests
-
 from app.core.logger import get_logger
-from app.services.github.github_client import get_github_headers
+from app.services.github.github_client import GITHUB_API_BASE_URL, github_get
 
 logger = get_logger(__name__)
 
-GITHUB_API_BASE_URL = "https://api.github.com"
 REQUEST_TIMEOUT = (5, 20)
 
 
@@ -44,14 +41,8 @@ def get_commit_details(
     )
 
     try:
-        response = requests.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            headers=get_github_headers()
-        )
-        response.raise_for_status()
-
-    except requests.exceptions.RequestException as exc:
+        response = github_get(url, timeout=REQUEST_TIMEOUT)
+    except RuntimeError as exc:
         logger.error(
             "Unable to retrieve commit %s for %s/%s",
             commit_sha[:8],
@@ -112,3 +103,63 @@ def get_commit_details(
     )
 
     return result
+
+
+def get_repository_commits(
+    owner: str,
+    repo: str,
+    *,
+    limit: int = 20,
+    collection_status: dict | None = None,
+) -> list[dict]:
+    """Collect recent repository commits and their changed files, within a cap."""
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("Repository owner is required.")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("Repository name is required.")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("Commit limit must be a positive integer.")
+
+    owner, repo = owner.strip(), repo.strip()
+    limit = min(limit, 99)
+    status = collection_status if collection_status is not None else {}
+    status.update({"limit_reached": False, "partial": False, "failed_file_details": 0})
+    url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/commits"
+    try:
+        response = github_get(url, params={"per_page": limit + 1, "page": 1}, timeout=(5, 60))
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("GitHub returned invalid repository commit data.") from exc
+    if not isinstance(data, list):
+        raise RuntimeError("GitHub returned an unexpected repository commit response.")
+
+    selected = data[:limit]
+    status["limit_reached"] = len(data) > limit
+    commits = []
+    for item in selected:
+        if not isinstance(item, dict) or not isinstance(item.get("sha"), str):
+            continue
+        commit_data = item.get("commit") if isinstance(item.get("commit"), dict) else {}
+        author = commit_data.get("author") if isinstance(commit_data.get("author"), dict) else {}
+        user = item.get("author") if isinstance(item.get("author"), dict) else {}
+        commit = {
+            "repository": f"{owner}/{repo}",
+            "sha": item["sha"],
+            "message": commit_data.get("message"),
+            "author": user.get("login") or author.get("name"),
+            "date": author.get("date"),
+            "html_url": item.get("html_url"),
+            "changed_files": [],
+        }
+        try:
+            details = get_commit_details(owner, repo, item["sha"])
+            commit["changed_files"] = details["changed_files"]
+            commit["author"] = details.get("author") or commit["author"]
+            commit["date"] = details.get("date") or commit["date"]
+        except (RuntimeError, ValueError) as exc:
+            status["partial"] = True
+            status["failed_file_details"] += 1
+            logger.warning("Changed files unavailable for commit %s in %s/%s: %s", item["sha"][:8], owner, repo, exc)
+        commits.append(commit)
+
+    return commits

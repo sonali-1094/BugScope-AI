@@ -1,13 +1,43 @@
 import os
+import re
 
 from app.core.logger import get_logger
+from app.services.github.github_client import GITHUB_API_BASE_URL, github_get
 from app.services.github.pull_request_service import (
     get_pull_request_files,
     get_repository_pull_requests,
 )
-import requests
-
 logger = get_logger(__name__)
+
+CLOSING_REFERENCE = re.compile(
+    r"\b(fixes?|closes?|resolves?)\s+"
+    r"((?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_issue_references(text: str | None, repository: str, source: str, sha: str | None = None) -> list[dict]:
+    """Extract explicit GitHub closing references; bare issue numbers are ignored."""
+    if not isinstance(text, str):
+        return []
+    references = []
+    for match in CLOSING_REFERENCE.finditer(text):
+        raw_target = match.group(2)
+        if "/" in raw_target:
+            target_repository, issue_number = raw_target.rsplit("#", 1)
+        else:
+            target_repository, issue_number = repository, raw_target[1:]
+        reference = {
+            "repository": target_repository,
+            "issue_number": int(issue_number),
+            "relationship": "explicit_closing_reference",
+            "source": source,
+            "evidence": match.group(0),
+        }
+        if sha:
+            reference["source_commit_sha"] = sha
+        references.append(reference)
+    return references
 
 
 def build_pull_request_relationship(
@@ -36,6 +66,8 @@ def build_pull_request_relationship(
 
     commit_relationships = []
     changed_files = set()
+    repository = pull_request.get("repository")
+    issue_references = []
 
     for commit in commits:
         if not isinstance(commit, dict):
@@ -78,6 +110,12 @@ def build_pull_request_relationship(
             "date": commit.get("date"),
             "changed_files": commit_files
         })
+        if isinstance(repository, str):
+            issue_references.extend(
+                extract_issue_references(
+                    commit.get("message"), repository, "commit_message", sha
+                )
+            )
 
     if pull_request_files is not None:
         changed_files = {
@@ -88,14 +126,22 @@ def build_pull_request_relationship(
             and file_info["filename"].strip()
         }
 
+    description = pull_request.get("description")
+    if isinstance(repository, str):
+        issue_references.extend(
+            extract_issue_references(description, repository, "pull_request_description")
+        )
+
     result = {
         "pull_request_number": pr_number,
+        "repository": repository,
         "pull_request_title": pull_request.get("title"),
         "pull_request_state": pull_request.get("state"),
         "merged_at": pull_request.get("merged_at"),
         "commits": commit_relationships,
         "changed_files": sorted(changed_files)
     }
+    result["issue_references"] = issue_references
 
     logger.info(
         "Built relationship data for PR #%s: %s commits, %s unique files",
@@ -105,67 +151,6 @@ def build_pull_request_relationship(
     )
 
     return result
-
-    # GitHub relationship retrival
-def get_pull_request_commits(
-        owner: str,
-        repo: str,
-        pull_number: int
-    ) -> list[dict]:
-    """
-       Fetch commits associated with a GitHub pull request.
-    """
-
-    if not owner or not repo:
-        raise ValueError("Repository owner and name are required.")
-
-    if pull_number < 1:
-        raise ValueError("Pull request number must be positive.")
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{owner}/{repo}/pulls/{pull_number}/commits"
-    )
-
-    logger.info(
-        "Fetching commits for PR #%s in %s/%s",
-        pull_number,
-        owner,
-        repo
-    )
-
-    try:
-        response = requests.get(
-            url,
-            params={"per_page": 100, "page": 1},
-            timeout=(5, 20)
-        )
-        response.raise_for_status()
-
-    except requests.exceptions.RequestException as exc:
-        logger.error(
-            "Unable to fetch commits for PR #%s in %s/%s",
-            pull_number,
-            owner,
-            repo
-        )
-        raise RuntimeError(
-            "Unable to retrieve pull-request commits from GitHub."
-        ) from exc
-
-    commits = response.json()
-
-    if not isinstance(commits, list):
-        raise RuntimeError("GitHub returned an invalid commit list.")
-
-    return [
-        {
-            "sha": commit["sha"],
-            "message": commit.get("commit", {}).get("message")
-        }
-        for commit in commits
-        if isinstance(commit, dict) and commit.get("sha")
-    ]
 
 def get_pull_request_commits(
     owner: str,
@@ -192,10 +177,7 @@ def get_pull_request_commits(
     owner = owner.strip()
     repo = repo.strip()
 
-    url = (
-        f"https://api.github.com/repos/"
-        f"{owner}/{repo}/pulls/{pull_number}/commits"
-    )
+    url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pull_number}/commits"
 
     commits = []
     page = 1
@@ -210,19 +192,15 @@ def get_pull_request_commits(
 
     while True:
         try:
-            response = requests.get(
+            response = github_get(
                 url,
                 params={
                     "per_page": per_page,
                     "page": page
                 },
-                timeout=(5, 20),
-                headers={
-                    "Accept": "application/vnd.github+json"
-                }
+                timeout=(5, 60),
             )
-
-        except requests.exceptions.RequestException as exc:
+        except RuntimeError as exc:
             logger.error(
                 "Unable to retrieve commits for PR #%s in %s/%s",
                 pull_number,
@@ -232,19 +210,6 @@ def get_pull_request_commits(
             raise RuntimeError(
                 "Unable to retrieve pull-request commits from GitHub."
             ) from exc
-
-        if response.status_code != 200:
-            logger.error(
-                "GitHub returned HTTP %s for PR #%s in %s/%s",
-                response.status_code,
-                pull_number,
-                owner,
-                repo
-            )
-            raise RuntimeError(
-                f"GitHub commit collection failed with status "
-                f"{response.status_code}."
-            )
 
         try:
             data = response.json()
@@ -274,7 +239,9 @@ def get_pull_request_commits(
 
             commits.append({
                 "sha": sha,
-                "message": commit_data.get("message")
+                "message": commit_data.get("message"),
+                "author": (commit_data.get("author") or {}).get("name"),
+                "date": (commit_data.get("author") or {}).get("date"),
             })
 
         if len(data) < per_page:
@@ -294,7 +261,8 @@ def get_pull_request_commits(
 def collect_pull_request_relationships(
     owner: str,
     repo: str,
-    pull_requests: list[dict] | None = None
+    pull_requests: list[dict] | None = None,
+    collection_status: dict | None = None,
 ) -> dict:
     """
     Collect commit and changed-file relationships for pull requests.
@@ -324,17 +292,16 @@ def collect_pull_request_relationships(
         raise ValueError("Pull requests must be provided as a list.")
 
     try:
-        relationship_limit = max(
-            1,
-            int(os.getenv("BUGSCOPE_MAX_RELATIONSHIP_PRS", "10")),
-        )
+        relationship_limit = max(1, int(os.getenv("BUGSCOPE_MAX_RELATIONSHIP_PRS", "10")))
     except ValueError:
-        relationship_limit = 25
+        relationship_limit = 10
 
     selected_pull_requests = pull_requests[:relationship_limit]
     skipped_pull_requests = len(pull_requests) - len(selected_pull_requests)
     relationships = []
     failed_pull_requests = []
+    files_truncated = 0
+    partial_file_requests = 0
 
     for pull_request in selected_pull_requests:
         if not isinstance(pull_request, dict):
@@ -361,17 +328,23 @@ def collect_pull_request_relationships(
                 pull_number
             )
 
+            file_status = {}
             changed_files = get_pull_request_files(
                 owner,
                 repo,
                 pull_number,
+                collection_status=file_status,
             )
+            if file_status.get("limit_reached"):
+                files_truncated += 1
+            if file_status.get("partial"):
+                partial_file_requests += 1
 
-            relationship = build_pull_request_relationship(
-                pull_request,
-                commit_references,
-                changed_files,
-            )
+            relationship = build_pull_request_relationship(pull_request, commit_references, changed_files)
+            relationship["repository"] = f"{owner}/{repo}"
+            for issue_reference in relationship["issue_references"]:
+                if issue_reference["repository"].casefold() == f"{owner}/{repo}".casefold():
+                    issue_reference["source_pull_request_merged"] = bool(pull_request.get("merged"))
 
             relationships.append(relationship)
 
@@ -397,6 +370,13 @@ def collect_pull_request_relationships(
         skipped_pull_requests,
     )
 
+    if collection_status is not None:
+        collection_status.update({
+            "limit_reached": skipped_pull_requests > 0,
+            "partial": bool(failed_pull_requests or files_truncated or partial_file_requests),
+            "files_truncated": files_truncated,
+            "partial_file_requests": partial_file_requests,
+        })
     return {
         "relationships": relationships,
         "failed_pull_requests": failed_pull_requests,

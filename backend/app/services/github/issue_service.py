@@ -1,29 +1,18 @@
 # This file extracts the github ISSUES
 
-import requests
-
 from app.core.logger import get_logger
-from app.services.github.github_client import get_github_headers
+from app.services.github.github_client import (
+    GITHUB_API_BASE_URL,
+    GitHubAPIError,
+    GitHubNetworkError,
+    describe_github_error,
+    github_get,
+)
 
 logger = get_logger(__name__)
 
-GITHUB_API_BASE_URL = "https://api.github.com"
-REQUEST_TIMEOUT = (5, 60)
-PER_PAGE = 20
+PER_PAGE = 100
 MAX_PAGES = 5
-
-
-class GitHubAPIError(Exception):
-    """Raised when GitHub returns an unsuccessful API response."""
-
-    def __init__(self, status_code: int, message: str, rate_limited: bool = False):
-        self.status_code = status_code
-        self.rate_limited = rate_limited
-        super().__init__(message)
-
-
-class GitHubNetworkError(Exception):
-    """Raised when a network error prevents communication with GitHub."""
 
 
 def get_repository_issues(owner: str, repo: str, collection_status: dict | None = None) -> list[dict]:
@@ -51,8 +40,8 @@ def get_repository_issues(owner: str, repo: str, collection_status: dict | None 
     bugs = []
     page = 1
 
-    if collection_status is not None:
-        collection_status["limit_reached"] = False
+    status = collection_status if collection_status is not None else {}
+    status.update({"limit_reached": False, "partial": False, "failed_page": None, "error": None})
 
     logger.info(
         "Starting issue collection for %s/%s",
@@ -75,78 +64,21 @@ def get_repository_issues(owner: str, repo: str, collection_status: dict | None 
         )
 
         try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-                headers=get_github_headers(),
-            )
-
-        except requests.exceptions.Timeout as exc:
+            response = github_get(url, params=params, timeout=(5, 60))
+        except (GitHubNetworkError, GitHubAPIError) as exc:
             logger.warning(
-                "GitHub request timed out for %s/%s on page %s",
-                owner,
-                repo,
-                page,
-            )
-
-            if bugs:
-                logger.warning(
-                    "Returning %s partially collected issues for %s/%s; "
-                    "collection stopped at page %s",
-                    len(bugs),
-                    owner,
-                    repo,
-                    page,
-                )
-                break
-
-            raise GitHubNetworkError(
-                "GitHub took too long to respond. Please try again."
-            ) from exc
-
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "Network error for %s/%s on page %s: %s",
+                "GitHub request failed for %s/%s on page %s: %s",
                 owner,
                 repo,
                 page,
                 exc,
-                exc_info=True,
             )
             if bugs:
-                logger.warning(
-                    "Returning %s partially collected issue for %s%s",
-                    len(bugs),
-                    owner,
-                    repo,
-                )
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = describe_github_error(exc)
                 break
-
-            raise GitHubNetworkError(
-                "Unable to communicate with GitHub. Please try again."
-            ) from exc
-
-        if response.status_code != 200:
-            logger.warning(
-                "GitHub API returned HTTP %s for %s/%s",
-                response.status_code,
-                owner,
-                repo,
-            )
-
-            raise GitHubAPIError(
-                response.status_code,
-                f"GitHub API request failed with status "
-                f"{response.status_code}.",
-                rate_limited=(
-                    response.status_code == 429
-                    or (
-                        response.status_code == 403
-                        and response.headers.get("X-RateLimit-Remaining") == "0"
-                    )
-                ),
-            )
+            raise
 
         try:
             issues = response.json()
@@ -157,10 +89,12 @@ def get_repository_issues(owner: str, repo: str, collection_status: dict | None 
                 owner,
                 repo,
             )
-            raise GitHubAPIError(
-                response.status_code,
-                "GitHub returned an invalid JSON response.",
-            ) from exc
+            if bugs:
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = "GitHub returned invalid JSON."
+                break
+            raise GitHubAPIError(response.status_code, "GitHub returned invalid JSON.") from exc
 
         if not isinstance(issues, list):
             logger.error(
@@ -168,10 +102,12 @@ def get_repository_issues(owner: str, repo: str, collection_status: dict | None 
                 owner,
                 repo,
             )
-            raise GitHubAPIError(
-                response.status_code,
-                "GitHub returned an unexpected response format.",
-            )
+            if bugs:
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = "GitHub returned an unexpected issue response."
+                break
+            raise GitHubAPIError(response.status_code, "GitHub returned an unexpected issue response.")
 
         # An empty page means there are no more results.
         if not issues:
@@ -239,18 +175,12 @@ def get_repository_issues(owner: str, repo: str, collection_status: dict | None 
             len(bugs),
         )
 
-        # A short page indicates the final page.
-        if len(issues) < PER_PAGE:
-            break
-
-        # A short page indicates the final page.
         if len(issues) < PER_PAGE:
             break
 
         # Warn if the configured page limit is reached.
         if page == MAX_PAGES:
-            if collection_status is not None:
-                collection_status["limit_reached"] = True
+            status["limit_reached"] = True
             logger.warning(
                 "Issue collection reached the configured page limit (%s) "
                 "for %s/%s. More issues may exist.",

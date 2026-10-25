@@ -1,16 +1,13 @@
-import requests
-
 from app.core.logger import get_logger
-from app.services.github.github_client import get_github_headers
+from app.services.github.github_client import GITHUB_API_BASE_URL, describe_github_error, github_get
 
 logger = get_logger(__name__)
-GITHUB_API_BASE_URL = "https://api.github.com"
-REQUEST_TIMEOUT = (15, 60)
-PER_PAGE = 20
-MAX_PAGES =2
+PER_PAGE = 100
+MAX_PAGES = 5
+MAX_FILE_PAGES = 10
 
 
-def get_repository_pull_requests(owner: str, repo: str) -> list[dict]:
+def get_repository_pull_requests(owner: str, repo: str, collection_status: dict | None = None) -> list[dict]:
     """Retrieve open and closed pull requests across all result pages."""
     if not isinstance(owner, str) or not owner.strip():
         raise ValueError("Repository owner is required.")
@@ -22,38 +19,46 @@ def get_repository_pull_requests(owner: str, repo: str) -> list[dict]:
     url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls"
     pull_requests = []
     page = 1
+    status = collection_status if collection_status is not None else {}
+    status.update({"limit_reached": False, "partial": False, "failed_page": None, "error": None})
 
     while page <= MAX_PAGES:
         try:
-            response = requests.get(
+            response = github_get(
                 url,
                 params={
                     "state": "all",
                     "per_page": PER_PAGE,
                     "page": page,
                     "sort": "created",
-                    "direction": "asc",
+                    "direction": "desc",
                 },
-                timeout=REQUEST_TIMEOUT,
-                headers=get_github_headers(),
+                timeout=(5, 60),
             )
-        except requests.exceptions.Timeout as exc:
-            logger.warning("Pull-request collection timed out for %s/%s", owner, repo)
-            raise RuntimeError("GitHub took too long to return pull requests.") from exc
-        except requests.exceptions.RequestException as exc:
-            logger.warning("Pull-request network error for %s/%s", owner, repo)
-            raise RuntimeError("Unable to retrieve pull requests from GitHub.") from exc
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"GitHub pull-request collection failed with status {response.status_code}."
-            )
+        except RuntimeError as exc:
+            if pull_requests:
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = describe_github_error(exc)
+                logger.warning("Partial pull-request collection for %s/%s at page %s: %s", owner, repo, page, exc)
+                break
+            raise
 
         try:
             data = response.json()
         except ValueError as exc:
+            if pull_requests:
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = "GitHub returned invalid JSON."
+                break
             raise RuntimeError("GitHub returned an invalid pull-request response.") from exc
         if not isinstance(data, list):
+            if pull_requests:
+                status["partial"] = True
+                status["failed_page"] = page
+                status["error"] = "GitHub returned an unexpected pull-request response."
+                break
             raise RuntimeError("GitHub returned an unexpected pull-request response.")
 
         for pull_request in data:
@@ -61,6 +66,7 @@ def get_repository_pull_requests(owner: str, repo: str) -> list[dict]:
                 continue
             user = pull_request.get("user")
             pull_requests.append({
+                "repository": f"{owner}/{repo}",
                 "number": pull_request.get("number"),
                 "title": pull_request.get("title"),
                 "description": pull_request.get("body"),
@@ -77,46 +83,47 @@ def get_repository_pull_requests(owner: str, repo: str) -> list[dict]:
 
         if len(data) < PER_PAGE:
             break
+        if page == MAX_PAGES:
+            status["limit_reached"] = True
+            break
         page += 1
 
     logger.info("Collected %s pull requests for %s/%s", len(pull_requests), owner, repo)
     return pull_requests
 
 
-def get_pull_request_files(owner: str, repo: str, pull_number: int) -> list[dict]:
+def get_pull_request_files(owner: str, repo: str, pull_number: int, collection_status: dict | None = None) -> list[dict]:
     """Retrieve files changed by a pull request across all result pages."""
     url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pull_number}/files"
     files = []
     page = 1
+    status = collection_status if collection_status is not None else {}
+    status.update({"limit_reached": False, "partial": False, "failed_page": None})
 
     while True:
         try:
-            response = requests.get(
-                url,
-                params={"per_page": PER_PAGE, "page": page},
-                timeout=REQUEST_TIMEOUT,
-                headers=get_github_headers(),
-            )
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(
-                "Unable to retrieve changed files from GitHub."
-            ) from exc
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"GitHub changed-file collection failed with status {response.status_code}."
-            )
+            response = github_get(url, params={"per_page": PER_PAGE, "page": page}, timeout=(5, 60))
+        except RuntimeError:
+            if files:
+                status["partial"] = True
+                status["failed_page"] = page
+                return files
+            raise
 
         try:
             data = response.json()
         except ValueError as exc:
-            raise RuntimeError(
-                "GitHub returned an invalid changed-file response."
-            ) from exc
+            if files:
+                status["partial"] = True
+                status["failed_page"] = page
+                return files
+            raise RuntimeError("GitHub returned an invalid changed-file response.") from exc
         if not isinstance(data, list):
-            raise RuntimeError(
-                "GitHub returned an unexpected changed-file response."
-            )
+            if files:
+                status["partial"] = True
+                status["failed_page"] = page
+                return files
+            raise RuntimeError("GitHub returned an unexpected changed-file response.")
 
         for file_info in data:
             if not isinstance(file_info, dict):
@@ -133,6 +140,9 @@ def get_pull_request_files(owner: str, repo: str, pull_number: int) -> list[dict
 
         if len(data) < PER_PAGE:
             return files
+        if page == MAX_FILE_PAGES:
+            status["limit_reached"] = True
+            return files
         page += 1
 
 
@@ -144,19 +154,7 @@ def get_pull_request(owner: str, repo: str, pull_number: int) -> dict:
         raise ValueError("Pull request number must be positive.")
 
     url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pull_number}"
-    try:
-        response = requests.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            headers=get_github_headers(),
-        )
-    except requests.exceptions.Timeout as exc:
-        raise RuntimeError("GitHub API request timed out.") from exc
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError("Unable to connect to GitHub.") from exc
-
-    if response.status_code != 200:
-        raise RuntimeError(f"GitHub pull-request request failed with status {response.status_code}.")
+    response = github_get(url, timeout=(5, 60))
 
     try:
         pull_request = response.json()
