@@ -1,12 +1,23 @@
 # BugScope AI frontend
 
-React + Vite client for the existing FastAPI GitHub collection endpoint.
+React + Vite dashboard for the FastAPI GitHub analysis endpoint.
 
-## Run locally
+## Setup
 
-1. Copy `.env.example` to `.env` and set `VITE_API_BASE_URL` if the backend is not at `http://localhost:8000`.
-2. Install dependencies with `npm install`.
-3. Start the backend from `../backend` with `uvicorn app.main:app --reload`.
-4. Start the frontend with `npm run dev` and open the URL printed by Vite.
+From the project root, install root dependencies with `npm.cmd install`. Copy
+`frontend/.env.example` to `frontend/.env` if the API is not at its default
+address, and set `VITE_API_BASE_URL` to the FastAPI base URL. Then:
 
-The client sends `POST /api/repositories/analyze` with `{ "repository_url": "https://github.com/owner/repository" }`. GitHub credentials remain backend-only.
+```powershell
+Set-Location frontend
+npm.cmd install
+npm.cmd run dev
+```
+
+The default API URL is `http://127.0.0.1:8010`. The dashboard posts
+`{ "repository_url": "https://github.com/owner/repository" }` to
+`POST /api/repositories/analyze`. It displays partial collection warnings and
+whether the response confirms PostgreSQL persistence. GitHub and database
+credentials belong only in backend environment files, never in Vite variables.
+
+Build for a static production bundle with `npm.cmd run build` from `frontend/`.

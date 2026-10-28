@@ -34,14 +34,19 @@ function StatusBanner({ analysis }) {
   const partial = analysis.status !== 'complete'
   const warnings = analysis.warnings || []
   return (
-    <div className={`status-banner ${partial ? 'is-partial' : 'is-complete'}`} role="status">
-      <span className="status-indicator" aria-hidden="true" />
-      <div>
-        <strong>{partial ? 'Collection completed with gaps' : 'Collection complete'}</strong>
-        <p>{partial ? 'Some repository data could not be collected. Review the notes below.' : 'All requested collection steps returned successfully.'}</p>
-        {warnings.length > 0 && <ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+    <>
+      <div className={`status-banner ${partial ? 'is-partial' : 'is-complete'}`} role="status">
+        <span className="status-indicator" aria-hidden="true" />
+        <div>
+          <strong>{partial ? 'Collection completed with gaps' : 'Collection complete'}</strong>
+          <p>{partial ? 'Some repository data could not be collected. Review the notes below.' : 'All requested collection steps returned successfully.'}</p>
+          {warnings.length > 0 && <ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+        </div>
       </div>
-    </div>
+      {analysis.persistence?.status !== 'persisted' && <div className="warning-list" role="status">
+        <span>Database save status: {analysis.persistence?.status || 'unknown'}. The analysis results are available, but this run is not confirmed in PostgreSQL.</span>
+      </div>}
+    </>
   )
 }
 

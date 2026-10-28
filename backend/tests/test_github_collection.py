@@ -161,6 +161,9 @@ class RelationshipAndEndpointTests(unittest.TestCase):
         )
         self.assertEqual(result["commits"][0]["commit_sha"], "abc")
         self.assertEqual(result["changed_files"], ["src/a.py"])
+        self.assertEqual(result["commit_count"], 1)
+        self.assertEqual(result["changed_file_count"], 1)
+        self.assertEqual(result["changed_file_details"][0]["filename"], "src/a.py")
         self.assertEqual([ref["issue_number"] for ref in result["issue_references"]], [13, 12])
 
     @patch("app.services.github.relationship_service.get_repository_pull_requests", return_value=[])

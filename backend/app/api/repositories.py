@@ -1,10 +1,12 @@
 import re
 import os
+import requests
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
 
 from app.core.logger import get_logger
+from app.normalization import normalize_analysis
 from app.schemas.repository import RepositoryRequest
 from app.services.github.issue_service import (
     GitHubAPIError,
@@ -250,7 +252,7 @@ def analyze_repository(request: RepositoryRequest):
     }
     logger.info("Analysis collection %s for %s/%s", status, owner, repo)
 
-    return {
+    analysis_response = {
         "repository": f"{owner}/{repo}",
         "repository_url": repository_details.get(
             "html_url",
@@ -271,4 +273,77 @@ def analyze_repository(request: RepositoryRequest):
         # Retained for clients of the original issues-only endpoint.
         "total_bugs": len(issues),
         "bugs": issues,
+        "persistence": {"status": "pending"},
     }
+
+    try:
+        normalized_analysis = normalize_analysis(analysis_response)
+    except Exception as exc:
+        # Keep analysis available to existing clients, while making a failed
+        # internal normalization visible without logging response data/secrets.
+        logger.error(
+            "Analysis normalization failed for %s/%s (error_type=%s)",
+            owner,
+            repo,
+            type(exc).__name__,
+        )
+        analysis_response["persistence"] = {"status": "failed", "reason": "normalization_failed"}
+    else:
+        logger.info(
+            "Normalized analysis for %s/%s: %s issues, %s pull requests, "
+            "%s commits, %s relationships",
+            owner,
+            repo,
+            len(normalized_analysis.issues),
+            len(normalized_analysis.pull_requests),
+            len(normalized_analysis.commits),
+            len(normalized_analysis.relationships),
+        )
+        ingest_url = os.getenv("BUGSCOPE_INGEST_URL", "http://127.0.0.1:5000/internal/normalized-analysis")
+        ingest_token = os.getenv("BUGSCOPE_INGEST_TOKEN")
+        if not ingest_token:
+            logger.error("Normalized persistence is not configured for %s/%s (missing service token)", owner, repo)
+            analysis_response["persistence"] = {"status": "not_configured"}
+        else:
+            try:
+                response = requests.post(
+                    ingest_url,
+                    json={"schema_version": 1, "analysis": normalized_analysis.model_dump(mode="json")},
+                    headers={"Authorization": f"Bearer {ingest_token}"},
+                    timeout=(3, 30),
+                )
+                response.raise_for_status()
+                ingest_result = response.json()
+                expected_run_id = normalized_analysis.collection_run.run_id
+                expected_repository_key = normalized_analysis.repository.repository_key
+                if (
+                    not isinstance(ingest_result, dict)
+                    or ingest_result.get("persisted") is not True
+                    or ingest_result.get("run_id") != expected_run_id
+                    or ingest_result.get("repository_key") != expected_repository_key
+                ):
+                    raise ValueError("Ingest service returned no matching persistence confirmation")
+            except (requests.RequestException, ValueError) as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                confirmation_invalid = isinstance(exc, ValueError)
+                logger.error(
+                    "Normalized persistence failed for %s/%s (error_type=%s, status=%s)",
+                    owner,
+                    repo,
+                    type(exc).__name__,
+                    status_code or "unavailable",
+                )
+                analysis_response["persistence"] = {
+                    "status": "failed",
+                    "reason": "invalid_persistence_confirmation" if confirmation_invalid else "database_ingest_failed",
+                    "http_status": status_code,
+                }
+            else:
+                logger.info("Persisted normalized analysis for %s/%s", owner, repo)
+                analysis_response["persistence"] = {
+                    "status": "persisted",
+                    "run_id": normalized_analysis.collection_run.run_id,
+                    "repository_key": normalized_analysis.repository.repository_key,
+                }
+
+    return analysis_response

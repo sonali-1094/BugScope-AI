@@ -1,156 +1,88 @@
 const { Octokit } = require("octokit");
-const Bug = require("../models/Bug");
-const Commit = require("../models/Commit");
-const Component = require("../models/Component");
+const { getPool } = require("../config/db");
 
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-
-// Matches "fixes #123", "closes #45", "resolves #7", or a bare "#123"
 const ISSUE_REF_REGEX = /\b(?:fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved)?\s*#(\d+)\b/gi;
-
 function extractIssueNumbers(message) {
   const numbers = new Set();
   let match;
-  while ((match = ISSUE_REF_REGEX.exec(message)) !== null) {
-    numbers.add(Number(match[1]));
-  }
+  while ((match = ISSUE_REF_REGEX.exec(message || "")) !== null) numbers.add(Number(match[1]));
   return [...numbers];
 }
 
-/**
- * Pulls issues labeled as bugs for a repo and upserts them into MongoDB.
- * We only keep genuine issues (GitHub's API returns PRs as issues too,
- * so we filter those out) that carry a bug-like label.
- */
+async function ensureRepository(owner, name, details = {}) {
+  const key = `${owner}/${name}`.toLowerCase();
+  await getPool().query(`INSERT INTO repositories(repository_key,owner,name,full_name,canonical_url,source_url) VALUES($1,$2,$3,$4,$5,$5) ON CONFLICT(repository_key) DO UPDATE SET full_name=EXCLUDED.full_name,updated_at=now()`,
+    [key, owner, name, `${owner}/${name}`, details.url || `https://github.com/${owner}/${name}`]);
+  return key;
+}
+
 async function collectBugs(owner, repo, { bugLabels = ["bug", "Bug", "type: bug"] } = {}) {
-  const repoFullName = `${owner}/${repo}`;
+  const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+  const repositoryKey = await ensureRepository(owner, repo);
   let saved = 0;
-
-  const iterator = octokit.paginate.iterator(octokit.rest.issues.listForRepo, {
-    owner,
-    repo,
-    state: "all",
-    per_page: 100,
-  });
-
+  const iterator = octokit.paginate.iterator(octokit.rest.issues.listForRepo, { owner, repo, state: "all", per_page: 100 });
   for await (const { data: issues } of iterator) {
     for (const issue of issues) {
-      if (issue.pull_request) continue; // skip PRs
-
-      const labels = issue.labels.map((l) => (typeof l === "string" ? l : l.name));
-      const isBug = labels.some((l) => bugLabels.includes(l));
-      if (!isBug) continue;
-
-      await Bug.findOneAndUpdate(
-        { repo: repoFullName, number: issue.number },
-        {
-          repo: repoFullName,
-          number: issue.number,
-          title: issue.title,
-          body: issue.body || "",
-          labels,
-          state: issue.state,
-          createdAt: issue.created_at,
-          closedAt: issue.closed_at || undefined,
-          url: issue.html_url,
-        },
-        { upsert: true, new: true }
-      );
+      if (issue.pull_request) continue;
+      const labels = issue.labels.map((label) => typeof label === "string" ? label : label.name);
+      if (!labels.some((label) => bugLabels.includes(label))) continue;
+      const client = await getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const result = await client.query(`INSERT INTO issues(entity_id,repository_key,number,title,body,state,source_created_at,closed_at,labels,author,comments,url,source_url)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) ON CONFLICT(repository_key,number) DO UPDATE SET title=EXCLUDED.title,body=EXCLUDED.body,state=EXCLUDED.state,source_created_at=EXCLUDED.source_created_at,closed_at=EXCLUDED.closed_at,labels=EXCLUDED.labels,author=EXCLUDED.author,comments=EXCLUDED.comments,url=EXCLUDED.url,updated_at=now() RETURNING id`,
+        [`${repositoryKey}#issue:${issue.number}`, repositoryKey, issue.number, issue.title, issue.body, issue.state, issue.created_at, issue.closed_at, labels, issue.user?.login, issue.comments, issue.html_url]);
+        await client.query(`INSERT INTO bugs(repository_key,number,title,body,labels,state,source_created_at,closed_at,url,issue_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          ON CONFLICT(repository_key,number) DO UPDATE SET title=EXCLUDED.title,body=EXCLUDED.body,labels=EXCLUDED.labels,state=EXCLUDED.state,source_created_at=EXCLUDED.source_created_at,closed_at=EXCLUDED.closed_at,url=EXCLUDED.url,issue_id=EXCLUDED.issue_id,updated_at=now()`,
+        [repositoryKey, issue.number, issue.title, issue.body, labels, issue.state, issue.created_at, issue.closed_at, issue.html_url, result.rows[0].id]);
+        await client.query("COMMIT");
+      } catch (error) { await client.query("ROLLBACK"); throw error; }
+      finally { client.release(); }
       saved += 1;
     }
   }
-
   return saved;
 }
 
-/**
- * Pulls recent commits for a repo, records which issues they reference
- * (so we can later link bugs to their fixing commits), and tracks which
- * file paths ("components") each commit touches.
- *
- * maxCommits caps API usage — each commit needs a separate getCommit call
- * to read its changed files, so keep this modest for large repos.
- */
 async function collectCommits(owner, repo, { maxCommits = 300 } = {}) {
-  const repoFullName = `${owner}/${repo}`;
+  const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+  const repositoryKey = await ensureRepository(owner, repo);
   let saved = 0;
-  let seen = 0;
-
-  const iterator = octokit.paginate.iterator(octokit.rest.repos.listCommits, {
-    owner,
-    repo,
-    per_page: 100,
-  });
-
+  const iterator = octokit.paginate.iterator(octokit.rest.repos.listCommits, { owner, repo, per_page: 100 });
   outer: for await (const { data: commits } of iterator) {
     for (const commit of commits) {
-      if (seen >= maxCommits) break outer;
-      seen += 1;
-
+      if (saved >= maxCommits) break outer;
       const message = commit.commit.message || "";
-      const referencedIssueNumbers = extractIssueNumbers(message);
-
-      // Fetch file list for this commit (needed for component/hotspot tracking)
       let filesChanged = [];
+      let fileFacts = [];
       try {
-        const { data: full } = await octokit.rest.repos.getCommit({
-          owner,
-          repo,
-          ref: commit.sha,
-        });
-        filesChanged = (full.files || []).map((f) => f.filename);
-      } catch (err) {
-        console.warn(`[collector] could not fetch files for ${commit.sha}: ${err.message}`);
+        const { data } = await octokit.rest.repos.getCommit({ owner, repo, ref: commit.sha });
+        fileFacts = data.files || [];
+        filesChanged = fileFacts.map((file) => file.filename);
+      } catch (error) {
+        console.warn(`[collector] changed files unavailable (${error.status || error.name})`);
       }
-
-      await Commit.findOneAndUpdate(
-        { repo: repoFullName, sha: commit.sha },
-        {
-          repo: repoFullName,
-          sha: commit.sha,
-          message,
-          author: commit.commit.author?.name,
-          date: commit.commit.author?.date,
-          url: commit.html_url,
-          filesChanged,
-          referencedIssueNumbers,
-        },
-        { upsert: true, new: true }
-      );
+      const sha = commit.sha.toLowerCase();
+      await getPool().query(`INSERT INTO commits(entity_id,repository_key,sha,message,author,authored_at,source_endpoints,source_url)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(repository_key,sha) DO UPDATE SET message=EXCLUDED.message,author=EXCLUDED.author,authored_at=EXCLUDED.authored_at,source_endpoints=(SELECT ARRAY(SELECT DISTINCT unnest(commits.source_endpoints || EXCLUDED.source_endpoints))),source_url=EXCLUDED.source_url,updated_at=now()`,
+      [`${repositoryKey}#commit:${sha}`, repositoryKey, sha, message, commit.commit.author?.name, commit.commit.author?.date, ["github.repository_commits"], commit.html_url]);
+      for (const file of fileFacts) {
+        await getPool().query(`INSERT INTO changed_file_observations(entity_id,repository_key,source_entity_type,source_entity_id,source_commit_entity_id,path,status,additions,deletions,source_endpoint,source_url)
+          VALUES($1,$2,'commit',$3,$3,$4,$5,$6,$7,'github.commit_files',$8) ON CONFLICT(repository_key,source_entity_type,source_entity_id,path) DO UPDATE SET status=COALESCE(EXCLUDED.status,changed_file_observations.status),additions=COALESCE(EXCLUDED.additions,changed_file_observations.additions),deletions=COALESCE(EXCLUDED.deletions,changed_file_observations.deletions),updated_at=now()`,
+        [`${repositoryKey}#file:commit:${sha}:${file.filename}`, repositoryKey, `${repositoryKey}#commit:${sha}`, file.filename, file.status, file.additions, file.deletions, commit.html_url]);
+        await getPool().query(`INSERT INTO components(repository_key,path,last_touched_at) VALUES($1,$2,$3) ON CONFLICT(repository_key,path) DO UPDATE SET last_touched_at=GREATEST(components.last_touched_at,EXCLUDED.last_touched_at),updated_at=now()`,
+        [repositoryKey, file.filename, commit.commit.author?.date]);
+      }
       saved += 1;
-
-      // Register/refresh components touched by this commit
-      for (const path of filesChanged) {
-        await Component.findOneAndUpdate(
-          { repo: repoFullName, path },
-          { $inc: { bugCount: 0 }, lastTouchedAt: commit.commit.author?.date },
-          { upsert: true }
-        );
-      }
-
-      // Link this commit back to any bug it references as a fix
-      if (referencedIssueNumbers.length) {
-        await Bug.updateMany(
-          { repo: repoFullName, number: { $in: referencedIssueNumbers } },
-          {
-            $addToSet: { fixCommitShas: commit.sha },
-          }
-        );
-      }
     }
   }
-
   return saved;
 }
 
-/**
- * Full Phase 1 run: bugs first (so commit linking has something to attach to),
- * then commits.
- */
 async function collectRepository(owner, repo, options = {}) {
   const bugsSaved = await collectBugs(owner, repo, options);
   const commitsSaved = await collectCommits(owner, repo, options);
   return { repo: `${owner}/${repo}`, bugsSaved, commitsSaved };
 }
 
-module.exports = { collectRepository, collectBugs, collectCommits };
+module.exports = { collectRepository, collectBugs, collectCommits, extractIssueNumbers };

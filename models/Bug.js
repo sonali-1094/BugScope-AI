@@ -4,6 +4,11 @@ const bugSchema = new mongoose.Schema(
   {
     repo: { type: String, required: true, index: true }, // e.g. "axios/axios"
     number: { type: Number, required: true }, // GitHub issue number
+    // Optional link to the canonical general Issue; hidden from legacy API output.
+    // Existing Bug ObjectIds and all current refs remain unchanged.
+    issueId: { type: mongoose.Schema.Types.ObjectId, ref: "Issue", select: false },
+    // Canonical case-folded owner/name key; backfill/index rollout is deferred.
+    repositoryKey: { type: String, select: false },
     title: { type: String, required: true },
     body: { type: String, default: "" },
     labels: [{ type: String }],
@@ -30,5 +35,8 @@ const bugSchema = new mongoose.Schema(
 );
 
 bugSchema.index({ repo: 1, number: 1 }, { unique: true });
+// Sparse so existing Bug documents without an Issue link do not conflict.
+// Preflight this index against any manually-added issueId values before deployment.
+bugSchema.index({ issueId: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model("Bug", bugSchema);

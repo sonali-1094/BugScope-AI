@@ -65,7 +65,7 @@ def build_pull_request_relationship(
         raise ValueError("Pull request must have a valid number")
 
     commit_relationships = []
-    changed_files = set()
+    changed_file_details = {}
     repository = pull_request.get("repository")
     issue_references = []
 
@@ -101,7 +101,12 @@ def build_pull_request_relationship(
                 "deletions": file_info.get("deletions", 0)
             })
 
-            changed_files.add(filename)
+            changed_file_details[filename] = {
+                "filename": filename,
+                "status": file_info.get("status"),
+                "additions": file_info.get("additions", 0),
+                "deletions": file_info.get("deletions", 0),
+            }
 
         commit_relationships.append({
             "commit_sha": sha,
@@ -118,13 +123,20 @@ def build_pull_request_relationship(
             )
 
     if pull_request_files is not None:
-        changed_files = {
-            file_info["filename"]
+        changed_file_details = {
+            file_info["filename"]: {
+                "filename": file_info["filename"],
+                "status": file_info.get("status"),
+                "additions": file_info.get("additions", 0),
+                "deletions": file_info.get("deletions", 0),
+            }
             for file_info in pull_request_files
             if isinstance(file_info, dict)
             and isinstance(file_info.get("filename"), str)
             and file_info["filename"].strip()
         }
+    changed_files = sorted(changed_file_details)
+    changed_file_rows = [changed_file_details[name] for name in changed_files]
 
     description = pull_request.get("description")
     if isinstance(repository, str):
@@ -139,7 +151,10 @@ def build_pull_request_relationship(
         "pull_request_state": pull_request.get("state"),
         "merged_at": pull_request.get("merged_at"),
         "commits": commit_relationships,
-        "changed_files": sorted(changed_files)
+        "commit_count": len(commit_relationships),
+        "changed_files": changed_files,
+        "changed_file_count": len(changed_files),
+        "changed_file_details": changed_file_rows,
     }
     result["issue_references"] = issue_references
 

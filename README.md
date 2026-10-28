@@ -1,81 +1,106 @@
-# BugScope AI — Phase 1 (Repository Data Collector)
+# BugScope AI
 
-This is the first working slice of BugScope AI: it connects to MongoDB, pulls
-bug-labeled issues and recent commits from a GitHub repo via the GitHub API,
-and links commits back to the bugs they mention fixing (e.g. "fixes #123").
+BugScope AI collects GitHub repository history to help developers investigate
+bugs using issues, pull requests, commits, changed files, and explicit
+relationships. The app has a React frontend, a Python FastAPI collection and
+normalization service, a Node/Express API and PostgreSQL persistence service,
+and a Neon PostgreSQL database. Bug-family detection and similarity ranking
+are not implemented yet.
 
-## What this phase does
+## Prerequisites
 
-- `services/githubCollector.js` — talks to GitHub, saves Bugs/Commits/Components
-- `models/` — Mongoose schemas: `Bug`, `Commit`, `Component`, `BugFamily` (the
-  last one is empty until Phase 2 — it's here so relationships have somewhere
-  to point)
-- `routes/collector.js` — HTTP endpoints to trigger a collection run and
-  inspect what got saved
+- Node.js and npm
+- Python 3.10 or newer
+- PostgreSQL/Neon credentials for persistence
+- A GitHub token is optional for public repositories but recommended for higher
+  API limits
 
-## Setup
+## Configure environment
 
-1. Install dependencies (already done if you got this scaffold from Claude):
-   ```bash
-   npm install
-   ```
-2. Copy the env template and fill in real values:
-   ```bash
-   cp .env.example .env
-   ```
-   - `MONGO_URI` — a local MongoDB (`mongodb://127.0.0.1:27017/bugscope`) or
-     an Atlas connection string
-   - `GITHUB_TOKEN` — a GitHub personal access token (classic). Without one
-     you're capped at 60 API requests/hour, which will not get you through
-     a real repo. Create one at https://github.com/settings/tokens (no
-     special scopes needed for public repos).
-3. Start MongoDB (`mongod` locally, or use Atlas — no local setup needed then).
-4. Run the server:
-   ```bash
-   npm run dev
-   ```
-   You should see:
-   ```
-   [db] connected to MongoDB (bugscope)
-   [server] BugScope AI backend listening on port 5000
-   ```
+Copy `.env.example` to root `.env`, `backend/.env.example` to
+`backend/.env`, and `frontend/.env.example` to `frontend/.env`. Use local
+placeholders in the example files only. Put `DATABASE_URL` in root `.env` and
+set the same high-entropy `BUGSCOPE_INGEST_TOKEN` in root and `backend/.env`.
+Set `GITHUB_TOKEN` in `backend/.env`. The frontend only needs
+`VITE_API_BASE_URL=http://127.0.0.1:8010`; never put credentials in frontend
+environment variables.
 
-## Try it
+All `.env` files are ignored by Git; example files are tracked.
 
-Trigger a collection run against axios (start small — this hits the GitHub
-API once per commit to read changed files, so `maxCommits` keeps it sane):
+## Install
 
-```bash
-curl -X POST http://localhost:5000/api/collect \
-  -H "Content-Type: application/json" \
-  -d '{"owner": "axios", "repo": "axios", "maxCommits": 150}'
+From the project root in PowerShell:
+
+```powershell
+npm.cmd install
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+Set-Location frontend
+npm.cmd install
+Set-Location ..
 ```
 
-This can take a few minutes on the first run (issues aren't rate-limited,
-but each commit needs its own API call). Watch the server logs.
+## Migrate and start
 
-Then check what got stored:
+Run the migration once (the runner tracks applied filenames):
 
-```bash
-curl "http://localhost:5000/api/bugs?repo=axios/axios"
-curl "http://localhost:5000/api/commits?repo=axios/axios"
+```powershell
+npm.cmd run migrate
 ```
 
-## Known limitations (by design, for now)
+Start Express in one terminal:
 
-- Only issues carrying a `bug`-like label are saved — adjust `bugLabels` in
-  `collectBugs()` if a repo uses different label names (check the repo's
-  Issues page/labels first).
-- `fixCommitShas` is populated from **commit message text**, not GitHub's
-  own issue-timeline API. It catches "fixes #123" style messages, which
-  covers most real-world cases, but isn't 100% authoritative.
-- No embeddings yet, no Bug Family grouping yet, no dashboard yet — that's
-  Phases 2 onward.
+```powershell
+npm.cmd run dev
+```
 
-## Next (Phase 2 — Bug Family Intelligence)
+Start FastAPI in another terminal from the project root:
 
-Once you've got real Bug + Commit + Component data sitting in MongoDB, the
-next step is generating embeddings for each bug's title+body (via
-`transformers.js` — no Python needed) and clustering similar bugs into
-`BugFamily` documents. Come back when you're ready for that or if anything
-above breaks on you.
+```powershell
+python -m uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8010
+```
+
+Start Vite in a third terminal:
+
+```powershell
+Set-Location frontend
+npm.cmd run dev
+```
+
+The dashboard calls FastAPI `POST /api/repositories/analyze`. FastAPI collects
+and normalizes GitHub data, then sends it to Express's authenticated internal
+ingest endpoint. Express writes PostgreSQL records transactionally. The
+analysis response includes `persistence.status`; only `persisted` confirms the
+write succeeded. Express exposes `/api/bugs` and `/api/commits` read routes on
+port 5000. Its old `POST /api/collect` endpoint returns `410` to avoid a
+second active collection/persistence implementation.
+
+## Tests and checks
+
+```powershell
+npm.cmd test
+python -m unittest discover -s backend/tests -v
+```
+
+These automated tests use local mocks and do not need Neon credentials. Do not
+run application flows against a production database as a test. To check
+database setup manually, `node check-db.js` lists public table names without
+printing the database URL.
+
+## Troubleshooting
+
+- FastAPI `/health` works but analysis returns a GitHub error: inspect
+  `GITHUB_TOKEN` configuration with `GET /api/github/auth-status`; it never
+  returns the token.
+- `persistence.status` is `not_configured` or `failed`: ensure Express is
+  running, root `DATABASE_URL` is valid, and the ingest token matches in root
+  and `backend/.env`.
+- PostgreSQL TLS/network errors: confirm Neon availability and the local
+  connection string; never paste it into logs, issues, or chat.
+- Port conflicts: change `PORT` for Express or use another Uvicorn/Vite port
+  and update `VITE_API_BASE_URL` accordingly.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[docs/PROJECT_HANDOFF.md](docs/PROJECT_HANDOFF.md) for the data flow and
+current implementation limits.

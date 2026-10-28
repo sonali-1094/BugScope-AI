@@ -1,19 +1,22 @@
 {
   "name": "bugscope-ai-backend",
   "version": "1.0.0",
-  "description": "BugScope AI - Backend (Express + MongoDB + GitHub data collector)",
+  "description": "BugScope AI - Express API and PostgreSQL persistence service",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate": "node scripts/migrate.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "mongoose": "^8.5.0",
-    "octokit": "^4.0.2"
+    "octokit": "^4.0.2",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
